@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Battery Meltdown</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <style>
+    :root{
+      --bg:#0b0f17;--panel:#0f172a;--ink:#e5e7eb;--muted:#94a3b8;--accent:#60a5fa;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;
+    }
+    html,body{height:100%;}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;}
+    #wrap{position:fixed;inset:0;}
+    canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block;}
+    /* stacked canvases for overdraw */
+    #c1{z-index:0}
+    #c2{z-index:1;mix-blend-mode:screen;opacity:0.9}
+    #c3{z-index:2;mix-blend-mode:overlay;opacity:0.9}
+
+    /* control panel */
+    #hud{position:fixed;right:12px;top:12px;z-index:10;background:color-mix(in oklab,var(--panel) 85%, black 15%);
+      border:1px solid #1f2937;border-radius:14px;padding:12px 12px 10px 12px;box-shadow:0 10px 30px rgba(0,0,0,.35);backdrop-filter:blur(6px);min-width:280px}
+    #hud h1{font-size:14px;margin:0 0 8px 0;letter-spacing:.3px;color:var(--muted)}
+    #hud .row{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:6px 0}
+    #hud label{color:var(--muted);font-size:12px}
+    #hud input[type=range]{width:140px}
+    #hud input[type=number]{width:80px;background:#0b1220;color:var(--ink);border:1px solid #1f2937;border-radius:8px;padding:6px}
+    #hud .btn{appearance:none;border:1px solid #1f2937;background:#0b1220;color:var(--ink);padding:8px 10px;border-radius:10px;cursor:pointer}
+    #hud .btn:active{transform:translateY(1px)}
+    #hud .on{color:#111827;background:var(--accent);border-color:transparent}
+    #stats{font:12px/1.35 ui-monospace,Menlo,Consolas,monospace;color:#cbd5e1;margin-top:8px;max-width:320px;}
+    #footer{position:fixed;left:12px;bottom:12px;z-index:10;color:#94a3b8;font:12px/1.3 ui-monospace,Menlo,Consolas,monospace;background:rgba(0,0,0,.25);padding:8px 10px;border-radius:10px;border:1px solid #1f2937}
+    .warn{color:var(--warn)} .bad{color:var(--bad)} .ok{color:var(--ok)}
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <!-- three canvases to allow stacking / overdraw -->
+  <canvas id="c1"></canvas>
+  <canvas id="c2"></canvas>
+  <canvas id="c3"></canvas>
+</div>
+
+<div id="hud">
+  <h1>Battery Meltdown</h1>
+  <div class="row"><label>Render Scale (<span id="scaleVal">2.5</span>× DPR)</label><input id="scale" type="range" min="1.0" max="3.5" step="0.1" value="2.5"></div>
+  <div class="row"><label>Ray Steps (<span id="stepsVal">128</span>)</label><input id="steps" type="range" min="32" max="192" step="8" value="128"></div>
+  <div class="row"><label>Post Passes (<span id="passesVal">2</span>)</label><input id="passes" type="range" min="0" max="3" step="1" value="2"></div>
+  <div class="row"><label>Canvases</label>
+    <select id="layers">
+      <option value="1">1</option>
+      <option value="2">2</option>
+      <option value="3" selected>3</option>
+    </select>
+  </div>
+  <div class="row"><label>Workers</label>
+    <select id="workers">
+      <option value="0">0</option>
+      <option value="1">1</option>
+      <option value="2" selected>2</option>
+      <option value="3">3</option>
+    </select>
+  </div>
+  <div class="row"><label>Adaptive Target FPS</label>
+    <select id="fps">
+      <option value="60">60</option>
+      <option value="90">90</option>
+      <option value="120" selected>120</option>
+    </select>
+  </div>
+  <div class="row"><label>Battery Wh</label><input id="wh" type="number" step="0.1" value="12.7"></div>
+  <div class="row"><button id="toggle" class="btn on">Running</button><button id="fullscreen" class="btn">Fullscreen</button></div>
+  <div id="stats">—</div>
+</div>
+<div id="footer">Tip: Add to Home Screen, set brightness 100%, Auto‑Lock: Never, Low Power Mode: Off.</div>
+
+<script>
+// --- Minimal PWA bits ---
+(function(){
+  const manifest = {name:"Battery Meltdown", short_name:"Meltdown", display:"fullscreen", background_color:"#0b0f17", theme_color:"#0b0f17", icons:[]};
+  const url = URL.createObjectURL(new Blob([JSON.stringify(manifest)], {type:'application/json'}));
+  const link = document.createElement('link'); link.rel='manifest'; link.href=url; document.head.appendChild(link);
+  const swCode = `self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());`;
+  try{ navigator.serviceWorker?.register(URL.createObjectURL(new Blob([swCode],{type:'text/javascript'}))); }catch(e){}
+})();
+
+// --- UI wiring ---
+const el = (id)=>document.getElementById(id);
+const scaleUI = el('scale'), stepsUI = el('steps'), passesUI = el('passes'), layersUI = el('layers');
+const workersUI = el('workers'), fpsUI = el('fps'), whUI = el('wh');
+const scaleVal = el('scaleVal'), stepsVal = el('stepsVal'), passesVal = el('passesVal');
+const stats = el('stats');
+scaleUI.oninput = ()=> scaleVal.textContent = (+scaleUI.value).toFixed(1);
+stepsUI.oninput = ()=> stepsVal.textContent = stepsUI.value;
+passesUI.oninput = ()=> passesVal.textContent = passesUI.value;
+
+let running = true;
+el('toggle').onclick = ()=>{ running=!running; el('toggle').classList.toggle('on',running); el('toggle').textContent = running? 'Running':'Paused'; };
+el('fullscreen').onclick = ()=>{ if(document.fullscreenElement){document.exitFullscreen()} else {document.documentElement.requestFullscreen().catch(()=>{});} };
+
+// --- Worker code (Blob) ---
+const workerBlob = new Blob([`
+  let sum=0; function round(a){let x=a|0; for(let i=0;i<50000;i++){x=(x^(x<<13)); x=(x^(x>>>17)); x=(x^(x<<5));} return x>>>0;}
+  function fp(n){let y=0; for(let k=0;k<2000;k++){ y += Math.sin(n*1e-6*k)*Math.cos(k);} return y;}
+  let loops=0, t0=Date.now();
+  function tick(){ for(let i=0;i<200;i++){ const r = (Math.random()*1e9)|0; sum += round(r) + fp(r); loops++; }
+    if((loops&255)===0){ const dt=(Date.now()-t0)/1000; postMessage({loops, mloops:(loops/dt)/1e6}); }
+    setTimeout(tick,0);
+  }
+  onmessage = (e)=>{ if(e.data==='start') tick(); }
+`], {type:'text/javascript'});
+
+// --- WebGL utilities ---
+function makeGL(canvas){
+  const gl = canvas.getContext('webgl2', {antialias:false, preserveDrawingBuffer:false});
+  if(!gl) throw new Error('WebGL2 not available');
+  const vs = `#version 300 es
+ in vec2 p; void main(){ gl_Position=vec4(p,0.0,1.0);} `;
+  const fullQuad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, fullQuad, gl.STATIC_DRAW);
+  function link(fs){
+    const v = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(v,vs); gl.compileShader(v);
+    const f = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(f,fs); gl.compileShader(f);
+    if(!gl.getShaderParameter(f, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(f));
+    const pr = gl.createProgram(); gl.attachShader(pr,v); gl.attachShader(pr,f); gl.linkProgram(pr);
+    if(!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+    gl.useProgram(pr);
+    const loc = gl.getAttribLocation(pr,'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+    return pr;
+  }
+  return {gl, link};
+}
+
+function heavyFS(steps){return `#version 300 es
+ precision highp float; out vec4 o; uniform float t; uniform vec2 r;
+ float h(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123);}
+ float n2(vec2 p){vec2 i=floor(p), f=fract(p); float a=h(i), b=h(i+vec2(1,0)), c=h(i+vec2(0,1)), d=h(i+vec2(1,1)); vec2 u=f*f*(3.0-2.0*f); return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;}
+ float fbm(vec2 p){float v=0., a=.5; for(int i=0;i<6;i++){ v+=a*n2(p); p*=2.07; a*=.55;} return v;}
+ float map(vec3 p){ vec2 q = mod(p.xz, 2.5)-1.25; float s = length(q)-0.55; float b = max(abs(p.y)-0.35, max(abs(q.x)-0.6,abs(q.y)-0.6)); return min(s,b);}
+ vec3 norm(vec3 p){ float e=.002; vec2 k=vec2(1,-1); return normalize( k.xyy*map(p+k.xyy*e)+ k.yyx*map(p+k.yyx*e)+ k.yxy*map(p+k.yxy*e)+ k.xxx*map(p+k.xxx*e) ); }
+ void main(){ vec2 uv=(gl_FragCoord.xy/r)*2.-1.; uv.x*=r.x/r.y; float tm=t*.8; vec3 ro=vec3(0., .3+.2*sin(tm*.7), -2.6); vec3 ta=vec3(0.); vec3 ww=normalize(ta-ro), uu=normalize(cross(vec3(0,1,0),ww)), vv=cross(ww,uu); vec3 rd=normalize(uu*uv.x + vv*uv.y + ww*1.7); float d=0.; vec3 p; for(int i=0;i<${steps};i++){ p = ro + rd*d; float m = map(p); d += m*.6; } vec3 n = norm(p); float l = max(dot(n, normalize(vec3(.3,.8,.5))), 0.); float o1 = fbm(p.xz*3. + tm*.6); vec3 col = mix(vec3(.08,.10,.12), vec3(.2+.6*l,.2+.35*l,.25+.2*l), .7); col += .35*o1; for(int i=0;i<12;i++){ col = abs(col*1.23 - vec3(.08)); } o=vec4(col,1.); }`;}
+
+const postFS = `#version 300 es
+ precision highp float; out vec4 o; uniform sampler2D s; uniform vec2 dim; uniform int mode; // 0=blurX 1=blurY 2=tone
+  void main(){ vec2 uv = gl_FragCoord.xy/dim; vec3 c=texture(s,uv).rgb; if(mode==0){ vec2 d=vec2(1./dim.x,0.); c = texture(s,uv-4.0*d).rgb*.05 + texture(s,uv-2.0*d).rgb*.09 + texture(s,uv-d).rgb*.12 + c*.48 + texture(s,uv+d).rgb*.12 + texture(s,uv+2.0*d).rgb*.09 + texture(s,uv+4.0*d).rgb*.05; }
+  else if(mode==1){ vec2 d=vec2(0.,1./dim.y); c = texture(s,uv-4.0*d).rgb*.05 + texture(s,uv-2.0*d).rgb*.09 + texture(s,uv-d).rgb*.12 + c*.48 + texture(s,uv+d).rgb*.12 + texture(s,uv+2.0*d).rgb*.09 + texture(s,uv+4.0*d).rgb*.05; }
+  else { float lum = dot(c, vec3(0.2126,0.7152,0.0722)); c = c/(1.0+lum); vec2 q = uv*2.0-1.0; float v = smoothstep(1.2, 0.2, dot(q,q)); c *= v; }
+  o = vec4(c,1.0); }`;
+
+function makePingPong(gl, w,h){
+  const mk = ()=>{const tx=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,tx); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINE_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA, w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null); const fb=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tx, 0); return {tx,fb}; };
+  let A=mk(), B=mk(); return {A,B, resize:(nw,nh)=>{w=nw;h=nh; [A,B].forEach(o=>{gl.bindTexture(gl.TEXTURE_2D,o.tx); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);});}, w:()=>w, h:()=>h};
+}
+
+function Renderer(canvas){
+  const {gl, link} = makeGL(canvas);
+  let scale = 2.5, steps = 128, passes = 2;
+  let progMain = link(heavyFS(steps));
+  let ut = gl.getUniformLocation(progMain,'t');
+  let ur = gl.getUniformLocation(progMain,'r');
+  let progPost = link(postFS);
+  let uS = gl.getUniformLocation(progPost,'s');
+  let uDim = gl.getUniformLocation(progPost,'dim');
+  let uMode = gl.getUniformLocation(progPost,'mode');
+  let ping = makePingPong(gl, 16, 16);
+  function setSize(){ const w=Math.max(2, Math.floor(innerWidth*devicePixelRatio*scale)); const h=Math.max(2, Math.floor(innerHeight*devicePixelRatio*scale)); canvas.width=w; canvas.height=h; gl.viewport(0,0,w,h); ping.resize(w,h);} 
+  function setScale(x){ scale=x; setSize(); }
+  function setSteps(s){ steps=s; progMain = link(heavyFS(steps)); ut = gl.getUniformLocation(progMain,'t'); ur = gl.getUniformLocation(progMain,'r'); }
+  function setPasses(p){ passes=p|0; }
+  setSize();
+
+  let t0=performance.now();
+  let lastT=performance.now(); let dtAvg=0.0; let fpsSmoothed=0;
+  function draw(){ if(!running) return; const now=performance.now(); const t=(now-t0)/1000;
+    gl.useProgram(progMain); gl.uniform1f(ut,t); gl.uniform2f(ur, canvas.width, canvas.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, passes? ping.A.fb : null);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+
+    if(passes){
+      gl.useProgram(progPost); gl.uniform2f(uDim, ping.w(), ping.h());
+      gl.uniform1i(uMode, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ping.A.tx); gl.uniform1i(uS,0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, ping.B.fb); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+      if(passes>1){ gl.uniform1i(uMode, 1); gl.bindTexture(gl.TEXTURE_2D, ping.B.tx); gl.bindFramebuffer(gl.FRAMEBUFFER, ping.A.fb); gl.drawArrays(gl.TRIANGLE_STRIP,0,4); }
+      gl.uniform1i(uMode, 2); gl.bindTexture(gl.TEXTURE_2D, passes>1? ping.A.tx : ping.B.tx); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    }
+
+    const dt = now - lastT; lastT = now; dtAvg = dtAvg*0.9 + dt*0.1; fpsSmoothed = 1000/Math.max(1,dtAvg);
+    return fpsSmoothed;
+  }
+  function info(){ return {scale, steps, passes, dtAvg, fps: 1000/Math.max(1,dtAvg)}; }
+  return {draw, setScale, setSteps, setPasses, info, setSize};
+}
+
+let renderers = []; let workers=[]; let workerInfos=[]; const canvases=[document.getElementById('c1'), document.getElementById('c2'), document.getElementById('c3')];
+
+function applySettings(){ const sc = +scaleUI.value, st = +stepsUI.value, ps = +passesUI.value; renderers.forEach(r=>{ r.setScale(sc); r.setSteps(st); r.setPasses(ps); }); }
+[scaleUI, stepsUI, passesUI, layersUI, fpsUI].forEach(x=> x.addEventListener('input', ()=>applySettings()));
+
+function setWorkers(n){ workers.forEach(w=>w.terminate()); workers=[]; workerInfos=[]; for(let i=0;i<n;i++){ const w = new Worker(URL.createObjectURL(workerBlob)); w.onmessage = (e)=>{ workerInfos[i]=e.data; }; w.postMessage('start'); workers.push(w); } }
+workersUI.addEventListener('input', ()=> setWorkers(+workersUI.value));
+
+// --- Adaptive + Stats + Estimator ---
+function avgDt(){ let s=0,c=0; renderers.forEach(r=>{ if(r.info().dtAvg){ s+=r.info().dtAvg; c++; } }); return c? s/c : 1000/60; }
+function fps(){ return 1000/avgDt(); }
+function totalMloops(){ return workerInfos.reduce((a,b)=>a+(b?.mloops||0),0); }
+
+function estimateWatts(){
+  // Heuristic model: W ≈ display + GPU + CPU
+  const brightnessDisplayW = 1.8; // assume 100% brightness iPhone 15 Pro-ish
+  const sc = +scaleUI.value; const ps = +passesUI.value; const lay = +layersUI.value; const f = Math.min(120, fps())/60; // relative to 60fps
+  // GPU term: proportional to pixel cost (scale^2), passes, layers, and fps
+  const gpu = 0.9 * Math.pow(sc/2.0, 2) * (1 + 0.5*ps) * lay * f + 0.3; // +0.3 baseline
+  // CPU workers term: 0.25 W per Mloops/s (very rough)
+  const cpu = 0.25 * totalMloops();
+  return brightnessDisplayW + gpu + cpu; // W
+}
+function pctPerMin(){ const wh = +whUI.value || 12.7; const w = estimateWatts(); return (w/wh)*100/60; }
+
+function updateStats(){
+  const info = renderers.map(r=>r.info());
+  const perLayerFPS = info.map(i=> (i.fps? i.fps.toFixed(0):'-')).join('/');
+  const w = estimateWatts();
+  const ppm = pctPerMin();
+  const tpm = (ppm>0? (100/ppm) : 0).toFixed(1);
+  stats.innerHTML = `Layers:${layersUI.value} | Scale:${scaleUI.value}× | Steps:${stepsUI.value} | Passes:${passesUI.value} | FPS:${perLayerFPS}
+  <br>Workers:${workers.length} | CPU throughput: ${totalMloops().toFixed(2)} Mloops/s
+  <br><span class="ok">Est. power:</span> ${w.toFixed(2)} W · <span class="warn">Est. drain:</span> ${ppm.toFixed(2)} %/min · <span class="bad">Time to 0% (from 100%):</span> ~${tpm} min`;
+}
+
+function adapt(){
+  const target = +fpsUI.value; const targetDt = 1000/target; const avg = avgDt();
+  const sc = +scaleUI.value; const st = +stepsUI.value; const ps = +passesUI.value;
+  if(avg < targetDt*0.7){ if(st < 192) { stepsUI.value = String(st+8); stepsVal.textContent = stepsUI.value; }
+    else if(sc < 3.5){ scaleUI.value = (sc+0.1).toFixed(1); scaleVal.textContent = scaleUI.value; }
+    else if(ps < 3){ passesUI.value = String(ps+1); passesVal.textContent = passesUI.value; }
+    applySettings();
+  } else if(avg > targetDt*1.6){ if(sc > 1.0){ scaleUI.value = (sc-0.1).toFixed(1); scaleVal.textContent = scaleUI.value; applySettings(); } }
+}
+
+function loop(){
+  requestAnimationFrame(loop);
+  if(!running) return;
+  const nLayers = +layersUI.value;
+  for(let i=0;i<renderers.length;i++){
+    const canvas = canvases[i]; const vis = i<nLayers; canvas.style.display = vis? 'block':'none'; if(vis) renderers[i].draw();
+  }
+  if(performance.now()%500<16){ adapt(); updateStats(); }
+}
+
+function startMeltdown(){
+  renderers = canvases.map(c=>Renderer(c));
+  applySettings();
+  setWorkers(+workersUI.value);
+  loop();
+}
+
+// ---- AUTO‑START on load (no taps) ----
+window.addEventListener('load', ()=>{
+  startMeltdown();
+  // small nudge to keep the screen alive in PWAs (user should set Auto‑Lock: Never)
+  try{ navigator.wakeLock?.request('screen').catch(()=>{}); }catch(e){}
+});
+
+</script>
+</body>
+</html>
